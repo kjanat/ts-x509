@@ -24,6 +24,13 @@ import {
 } from '#micro509/internal/asn1/der';
 import { OIDS } from '#micro509/internal/asn1/oids';
 import { describeHashAlgorithm } from '#micro509/internal/crypto/algorithm-names';
+import {
+	chargeKdfBudget,
+	createKdfBudget,
+	DEFAULT_MAX_PKCS12_MAC_ITERATIONS,
+	isKdfIterationLimitError,
+	type KdfLimitOptions,
+} from '#micro509/internal/crypto/pbes2';
 import { getCrypto } from '#micro509/internal/crypto/webcrypto';
 import type { ErrorResult, Micro509Error } from '#micro509/result/result';
 import { failureResult, rethrowIfInvariant, successResult } from '#micro509/result/result';
@@ -94,7 +101,10 @@ export async function createPkcs12MacData(
 }
 
 /** Machine-readable failure reason for {@linkcode parsePkcs12MacData}. */
-export type ParsePkcs12MacDataErrorCode = 'malformed';
+export type ParsePkcs12MacDataErrorCode = 'malformed' | 'kdf_iterations_exceeded';
+
+/** Options for {@linkcode parsePkcs12MacData} and {@linkcode parsePkcs12MacDataOrThrow}. */
+export type ParsePkcs12MacDataOptions = KdfLimitOptions;
 
 /** Structured failure payload for MacData parsing. */
 export interface ParsePkcs12MacDataFailure extends Micro509Error<ParsePkcs12MacDataErrorCode> {
@@ -110,11 +120,14 @@ export type ParsePkcs12MacDataResult =
 /**
  * Throwing core for {@linkcode parsePkcs12MacData}. When `password` is
  * provided, verifies the MAC and reports the outcome in `verification`.
+ * Throws before deriving when the iteration count exceeds
+ * `options.maxKdfIterations`.
  */
 export async function parsePkcs12MacDataOrThrow(
 	der: Uint8Array,
 	authenticatedSafe: Uint8Array,
 	password?: string,
+	options?: ParsePkcs12MacDataOptions,
 ): Promise<ParsedPkcs12MacData> {
 	const top = readSequenceChildren(der);
 	const digestInfo = top[0];
@@ -169,6 +182,7 @@ export async function parsePkcs12MacDataOrThrow(
 			verification: 'unchecked',
 		};
 	}
+	chargeKdfBudget(createKdfBudget(options, DEFAULT_MAX_PKCS12_MAC_ITERATIONS), parsedIterations);
 	const expected = await computePkcs12Mac(
 		authenticatedSafe,
 		password,
@@ -189,18 +203,26 @@ export async function parsePkcs12MacDataOrThrow(
  * Decodes a DER-encoded MacData block. When `password` is provided, verifies
  * the MAC and reports the outcome in `verification`.
  *
- * Returns a typed failure (`code: 'malformed'`) on malformed input. For the
- * throwing form use {@linkcode parsePkcs12MacDataOrThrow}.
+ * Returns a typed failure (`code: 'malformed'`) on malformed input and
+ * `code: 'kdf_iterations_exceeded'` when the iteration count exceeds
+ * `options.maxKdfIterations`. For the throwing form use
+ * {@linkcode parsePkcs12MacDataOrThrow}.
  */
 export async function parsePkcs12MacData(
 	der: Uint8Array,
 	authenticatedSafe: Uint8Array,
 	password?: string,
+	options?: ParsePkcs12MacDataOptions,
 ): Promise<ParsePkcs12MacDataResult> {
 	try {
-		return successResult(await parsePkcs12MacDataOrThrow(der, authenticatedSafe, password));
+		return successResult(
+			await parsePkcs12MacDataOrThrow(der, authenticatedSafe, password, options),
+		);
 	} catch (error) {
 		rethrowIfInvariant(error);
+		if (isKdfIterationLimitError(error)) {
+			return failureResult('kdf_iterations_exceeded', error.message);
+		}
 		return failureResult('malformed', error instanceof Error ? error.message : 'Malformed MacData');
 	}
 }

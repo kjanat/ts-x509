@@ -12,10 +12,13 @@ jobs:
     permissions: { id-token: write, contents: read, pull-requests: write }
     steps:
       - { uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: { persist-credentials: false } } # v7
-      - { uses: ./.github/actions/setup-ts, with: { install-bun: true, install-node: true } }
+      - { uses: $/.github/actions/setup-ts, with: { install-bun: true, install-node: true } }
       - run: runner install -f build
       - id: pkg-pr
         timeout-minutes: 1
         continue-on-error: true # pkg.pr.new intermittently returns unrelated Cloudflare 500/1101 errors and hangs; previews are non-critical.
-        run: run -q publish:pkgprnew --json pkgpr.json; echo "meta=$(jq -c . pkgpr.json)" | tee -a "${GITHUB_OUTPUT}"
+        run: |
+          run -q publish:pkgprnew --json pkgpr.json
+          meta="$(jq -c . pkgpr.json)"
+          echo "meta=${meta}" | tee -a "${GITHUB_OUTPUT}"
       - { run: echo boo, if: always() }

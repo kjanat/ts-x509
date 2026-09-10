@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { persist-credentials: false }
-      - uses: ./.github/actions/setup-ts
+      - uses: $/.github/actions/setup-ts
         with: { install-bun: true, install-node: true, install-deno: true }
       - name: Build (runs attw + publint + unused-export checks)
         run: runner install -f build
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { persist-credentials: false }
-      - uses: ./.github/actions/setup-ts
+      - uses: $/.github/actions/setup-ts
         with: { install-bun: true, install-node: true, install-deno: true }
       - run: runner install -f site:build
         env: { GITHUB_TOKEN: "${{ github.token }}" }
@@ -59,18 +59,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { persist-credentials: false }
-      - uses: ./.github/actions/setup-ts
+      - uses: $/.github/actions/setup-ts
         with: { install-bun: true, install-node: true, install-deno: true }
       - run: runner install -sf bd playwright:chromium smoke
 
   differential:
     name: OpenSSL differential
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions: { contents: read }
-    env: { DIFFERENTIAL_OPENSSL: "1" }
+    env: { DIFFERENTIAL_OPENSSL: "1", EXPECTED_OPENSSL_VERSION: "3.5.5" }
     steps:
       - { uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: { persist-credentials: false } } # v7
-      - { uses: ./.github/actions/setup-ts, with: { install-bun: "true" } }
-      - run: openssl version
+      - { uses: $/.github/actions/setup-ts, with: { install-bun: "true" } }
+      - name: Assert OpenSSL oracle version
+        run: |
+          version="$(openssl version)"
+          echo "${version}"
+          case "${version}" in
+            "OpenSSL ${EXPECTED_OPENSSL_VERSION} "*) ;;
+            *) echo "::error::expected OpenSSL ${EXPECTED_OPENSSL_VERSION}, the differential oracle is version-sensitive"; exit 1 ;;
+          esac
       - run: runner install -f test:differential

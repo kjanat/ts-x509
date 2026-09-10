@@ -60,6 +60,24 @@ type IssuerCandidateEvaluation =
 	| { readonly ok: true; readonly nextCaBelowCount: number }
 	| { readonly ok: false; readonly failure: VerifyChainFailure };
 
+/**
+ * The signature checks {@linkcode buildChainInternal} performs, injected per
+ * call. A caller can wrap them to observe how much cryptographic work path
+ * building costs; replacing a global would leak across concurrent searches.
+ */
+export interface VerifyPathSignatureChecks {
+	/** Verifies a certificate against a candidate issuer certificate. */
+	readonly certificate: (
+		certificate: ParsedCertificate,
+		issuer: ParsedCertificate,
+	) => Promise<VerifyCertificateSignatureResult>;
+	/** Verifies a certificate against a bare trust anchor. */
+	readonly trustAnchor: (
+		certificate: ParsedCertificate,
+		anchor: TrustAnchor,
+	) => Promise<VerifyCertificateSignatureResult>;
+}
+
 /** Loose input for constructing failure detail objects during path building. */
 export interface VerifyPathFailureDetailsInput {
 	/** Common name of the certificate under evaluation, if known. */
@@ -163,6 +181,12 @@ export async function verifyCertificateSignature(
 	return result;
 }
 
+/** The real signature checks, used unless a caller injects its own. */
+const DEFAULT_SIGNATURE_CHECKS: VerifyPathSignatureChecks = {
+	certificate: verifyCertificateSignature,
+	trustAnchor: verifyTrustAnchorSignature,
+};
+
 /**
  * Depth-first chain search from leaf to root. Tries all issuer candidates,
  * checking validity, CA constraints, AKI, pathLength, and signatures at each
@@ -176,6 +200,7 @@ export async function buildChainInternal(
 	trustAnchors: readonly TrustAnchor[],
 	at: Date,
 	callbacks: VerifyPathCallbacks,
+	signatureChecks: VerifyPathSignatureChecks = DEFAULT_SIGNATURE_CHECKS,
 ): Promise<InternalBuildResult> {
 	const candidates = [...intermediates, ...roots];
 	const subjectIndex = new Map<string, ParsedCertificate[]>();
@@ -196,6 +221,7 @@ export async function buildChainInternal(
 	let deepestMissingIssuerAt: number | undefined;
 	let preferredFailure: VerifyChainFailure | undefined;
 	const deadEnds = new Set<string>();
+	const signatureResults = new Map<string, Promise<VerifyCertificateSignatureResult>>();
 
 	candidates.forEach((candidate, index) => {
 		const key = canonicalDnKey(candidate.subject);
@@ -247,7 +273,13 @@ export async function buildChainInternal(
 		if (rootFingerprints.has(fingerprint(current))) {
 			return path;
 		}
-		const matchedAnchor = await matchTrustAnchor(current, anchorIndex, callbacks, path.length - 1);
+		const matchedAnchor = await matchTrustAnchor(
+			current,
+			anchorIndex,
+			callbacks,
+			path.length - 1,
+			verifyAnchorOnce,
+		);
 		if (matchedAnchor.failure !== undefined) {
 			recordFailure(matchedAnchor.failure, path);
 		}
@@ -257,8 +289,7 @@ export async function buildChainInternal(
 		if (path.length > maxDepth) {
 			return undefined;
 		}
-		const visitedKey = [...visited].sort().join(',');
-		const memoKey = `${fingerprint(current)}:${caBelowCount}:${visitedKey}`;
+		const memoKey = `${fingerprint(current)}:${caBelowCount}`;
 		if (deadEnds.has(memoKey)) {
 			return undefined;
 		}
@@ -325,6 +356,7 @@ export async function buildChainInternal(
 			caBelowCount,
 			at,
 			callbacks,
+			verifySignatureOnce,
 		);
 		if (!candidate.ok) {
 			recordFailure(candidate.failure, path);
@@ -333,6 +365,41 @@ export async function buildChainInternal(
 		const nextVisited = new Set(visited);
 		nextVisited.add(issuerFingerprint);
 		return await search(issuer, [...path, issuer], nextVisited, candidate.nextCaBelowCount);
+	}
+
+	function verifySignatureOnce(
+		certificate: ParsedCertificate,
+		issuer: ParsedCertificate,
+	): Promise<VerifyCertificateSignatureResult> {
+		return verifyOnce(
+			`c:${fingerprint(certificate)}:${toHex(issuer.subjectPublicKeyInfoDer)}`,
+			() => signatureChecks.certificate(certificate, issuer),
+		);
+	}
+
+	function verifyAnchorOnce(
+		certificate: ParsedCertificate,
+		anchor: TrustAnchor,
+	): Promise<VerifyCertificateSignatureResult> {
+		const anchorKey = `${anchor.publicKeyAlgorithmOid}:${anchor.publicKeyParametersOid ?? ''}:${toHex(
+			anchor.subjectPublicKeyInfoDer,
+		)}`;
+		return verifyOnce(`a:${fingerprint(certificate)}:${anchorKey}`, () =>
+			signatureChecks.trustAnchor(certificate, anchor),
+		);
+	}
+
+	/** One signature check per distinct certificate-and-key pair for the whole search. */
+	function verifyOnce(
+		key: string,
+		run: () => Promise<VerifyCertificateSignatureResult>,
+	): Promise<VerifyCertificateSignatureResult> {
+		let pending = signatureResults.get(key);
+		if (pending === undefined) {
+			pending = run();
+			signatureResults.set(key, pending);
+		}
+		return pending;
 	}
 
 	function updateDeepest(path: readonly ParsedCertificate[]): boolean {
@@ -362,6 +429,7 @@ async function evaluateIssuerCandidate(
 	caBelowCount: number,
 	at: Date,
 	callbacks: VerifyPathCallbacks,
+	verifySignature: typeof verifyCertificateSignature,
 ): Promise<IssuerCandidateEvaluation> {
 	const issuerConstraints = evaluateIssuerConstraints(
 		current,
@@ -374,7 +442,7 @@ async function evaluateIssuerCandidate(
 	if (!issuerConstraints.ok) {
 		return issuerConstraints;
 	}
-	const signatureResult = await verifyCertificateSignature(current, issuer);
+	const signatureResult = await verifySignature(current, issuer);
 	if (!signatureResult.ok) {
 		return {
 			ok: false,
@@ -575,6 +643,7 @@ async function matchTrustAnchor(
 	anchorIndex: ReadonlyMap<string, readonly TrustAnchor[]>,
 	callbacks: VerifyPathCallbacks,
 	index: number,
+	verifyAnchor: typeof verifyTrustAnchorSignature,
 ): Promise<TrustAnchorMatchResult> {
 	const anchors = anchorIndex.get(canonicalDnKey(certificate.issuer));
 	if (anchors === undefined) {
@@ -587,7 +656,7 @@ async function matchTrustAnchor(
 		// are non-reflexive and prepared/tagged namespaces can collide), so confirm
 		// the anchor's subject actually equals the certificate's issuer.
 		if (!compareDistinguishedNames(certificate.issuer, anchor.subject)) continue;
-		const verified = await verifyTrustAnchorSignature(certificate, anchor);
+		const verified = await verifyAnchor(certificate, anchor);
 		if (!verified.ok) {
 			// Capture the first failure but continue trying other anchors
 			if (firstFailure === undefined) {
@@ -632,7 +701,8 @@ function trustAnchorAkiMismatch(certificate: ParsedCertificate, anchor: TrustAnc
 	);
 }
 
-async function verifyTrustAnchorSignature(
+/** Verifies that `certificate` was signed by a bare trust anchor's key. */
+export async function verifyTrustAnchorSignature(
 	certificate: ParsedCertificate,
 	anchor: TrustAnchor,
 ): Promise<VerifyCertificateSignatureResult> {

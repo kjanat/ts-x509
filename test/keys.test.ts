@@ -49,8 +49,9 @@ import {
 	unwrap,
 } from '#micro509';
 import { toArrayBuffer, toHex } from '#micro509/internal/asn1/asn1';
-import { concatBytes, integerFromNumber, sequence } from '#micro509/internal/asn1/der';
+import { concatBytes, integerFromNumber, octetString, sequence } from '#micro509/internal/asn1/der';
 import { md5 } from '#micro509/internal/crypto/hash';
+import { encodePbes2AlgorithmIdentifier } from '#micro509/internal/crypto/pbes2';
 import { base64Encode } from '#micro509/internal/shared/base64';
 import { hexToBytes } from '#test/helpers';
 
@@ -1719,5 +1720,54 @@ describe('keys: algorithm inference', () => {
 			'malformed',
 			'Unsupported JWK key type',
 		);
+	});
+});
+
+describe('encrypted PKCS#8 KDF work-factor limit', () => {
+	it('rejects PBKDF2 iteration counts above maxKdfIterations before deriving', async () => {
+		const keyPair = await generateKeyPair({ kind: 'ecdsa', curve: 'P-256' });
+		const der = await exportEncryptedPkcs8Der(keyPair.privateKey, {
+			password: 'secret',
+			iterations: 4096,
+		});
+
+		const rejected = await importEncryptedPkcs8Der(der, 'secret', undefined, {
+			maxKdfIterations: 2048,
+		});
+		expect(rejected.ok).toBe(false);
+		if (!rejected.ok) {
+			expect(rejected.error.code).toBe('kdf_iterations_exceeded');
+		}
+
+		const accepted = await importEncryptedPkcs8Der(der, 'secret', undefined, {
+			maxKdfIterations: 4096,
+		});
+		expect(accepted.ok).toBe(true);
+	});
+
+	it('rejects a maxKdfIterations that is not a positive integer', async () => {
+		const keyPair = await generateKeyPair({ kind: 'ecdsa', curve: 'P-256' });
+		const der = await exportEncryptedPkcs8Der(keyPair.privateKey, { password: 'secret' });
+
+		expect(
+			importEncryptedPkcs8Der(der, 'secret', undefined, { maxKdfIterations: 0 }),
+		).rejects.toThrow(RangeError);
+	});
+
+	it('caps PBKDF2 iterations at 2,000,000 by default', async () => {
+		const algorithmIdentifier = encodePbes2AlgorithmIdentifier({
+			iterations: 2_000_001,
+			salt: new Uint8Array(8),
+			iv: new Uint8Array(16),
+			cipher: 'AES-256-CBC',
+			prf: 'HMAC-SHA-256',
+		});
+		const der = sequence([algorithmIdentifier, octetString(new Uint8Array(16))]);
+
+		const result = await importEncryptedPkcs8Der(der, 'secret');
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.error.code).toBe('kdf_iterations_exceeded');
+		}
 	});
 });

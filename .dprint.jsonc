@@ -76,10 +76,10 @@
 		"cwd": "${configDir}",
 		"commands": [
 			{
-				"command": "tombi format - --stdin-filename {{file_path}}",
+				"command": "node_modules/.bin/tombi format - --stdin-filename {{file_path}}",
 				"exts": ["toml"],
 				"cacheKeyFiles": ["tombi.toml"],
-				"setupCommand": "npm i -g tombi"
+				"setupCommand": "bun install"
 			}
 		]
 	},

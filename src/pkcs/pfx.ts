@@ -27,7 +27,15 @@ import {
 	tlv,
 } from '#micro509/internal/asn1/der';
 import { OIDS } from '#micro509/internal/asn1/oids';
-import { decryptPbes2, encryptPbes2, isWrongPasswordError } from '#micro509/internal/crypto/pbes2';
+import {
+	createKdfBudget,
+	decryptPbes2,
+	encryptPbes2,
+	isKdfIterationLimitError,
+	isWrongPasswordError,
+	type KdfBudget,
+	type KdfLimitOptions,
+} from '#micro509/internal/crypto/pbes2';
 import { base64Encode } from '#micro509/internal/shared/base64';
 import type { EncryptedPkcs8Options } from '#micro509/keys/keys';
 import { exportPkcs8Der } from '#micro509/keys/keys';
@@ -35,7 +43,7 @@ import { pemEncode, splitPemBlocksOrThrow } from '#micro509/pem/pem';
 import type { ParsedPkcs12MacData, Pkcs12MacOptions } from '#micro509/pkcs/pkcs12-mac';
 import { createPkcs12MacData, parsePkcs12MacData } from '#micro509/pkcs/pkcs12-mac';
 import type { ErrorResult, Micro509Error } from '#micro509/result/result';
-import { failureResult } from '#micro509/result/result';
+import { failureResult, rethrowIfInvariant } from '#micro509/result/result';
 import type { ParsedCertificate } from '#micro509/x509/parse';
 import { parseCertificateDerOrThrow } from '#micro509/x509/parse';
 
@@ -85,8 +93,10 @@ export interface CreatePfxInput {
 /** PBES2 encryption settings for PFX key-bag protection. Alias of {@linkcode EncryptedPkcs8Options}. */
 export type PfxEncryptionOptions = EncryptedPkcs8Options;
 
+export type { KdfLimitOptions } from '#micro509/internal/crypto/pbes2';
+
 /** Options for {@linkcode parsePfxDer} and {@linkcode parsePfxPem}. */
-export interface ParsePfxOptions {
+export interface ParsePfxOptions extends KdfLimitOptions {
 	/** Password used to decrypt PBES2-encrypted ContentInfo entries. Also used for MAC verification when `macPassword` is omitted. */
 	readonly password?: string;
 	/** Separate password for MAC verification. Falls back to `password` when omitted. */
@@ -173,7 +183,11 @@ export interface ParsedPfx {
 // Result types for PFX parsing
 
 /** Error codes returned by {@linkcode parsePfxDer} and {@linkcode parsePfxPem}. */
-export type ParsePfxErrorCode = 'malformed' | 'invalid_password' | 'password_required';
+export type ParsePfxErrorCode =
+	| 'malformed'
+	| 'invalid_password'
+	| 'password_required'
+	| 'kdf_iterations_exceeded';
 
 /** Error payload for a failed PFX parse. */
 export interface ParsePfxFailure extends Micro509Error<ParsePfxErrorCode> {
@@ -348,27 +362,27 @@ export async function parsePfxDer(
 		const macElement = topLevel[2];
 		let macData: ParsedPkcs12MacData | undefined;
 		if (macElement !== undefined) {
-			const macResult = await parsePkcs12MacData(
+			const macResult = await verifyPfxMacData(
 				der.slice(macElement.start - macElement.headerLength, macElement.end),
 				authenticatedSafeOctets,
-				options?.macPassword ?? options?.password,
+				options,
 			);
-			if (!macResult.ok) {
-				return pfxFailure('malformed', 'Malformed PFX MacData');
+			if (macResult.error !== undefined) {
+				return macResult.error;
 			}
-			macData = macResult.value;
-			if (macData.verification === 'invalid') {
-				return pfxFailure('invalid_password', 'Invalid PFX MAC password or corrupted content');
-			}
+			macData = macResult.macData;
 		}
 		const authenticatedSafe = readSequenceChildren(authenticatedSafeOctets);
 		const bags: ParsedPfxBag[] = [];
+		// One budget for the whole file: entries that each sit under the ceiling
+		// must not be able to sum past it.
+		const budget = createKdfBudget(options);
 		for (const contentInfo of authenticatedSafe) {
 			const contentInfoDer = authenticatedSafeOctets.slice(
 				contentInfo.start - contentInfo.headerLength,
 				contentInfo.end,
 			);
-			const safeContentsResult = await extractSafeContents(contentInfoDer, options);
+			const safeContentsResult = await extractSafeContents(contentInfoDer, options, budget);
 			if (safeContentsResult.error !== undefined) {
 				return safeContentsResult.error;
 			}
@@ -387,7 +401,8 @@ export async function parsePfxDer(
 				...(macData === undefined ? {} : { macData }),
 			},
 		};
-	} catch {
+	} catch (error) {
+		rethrowIfInvariant(error);
 		return pfxFailure('malformed', 'Malformed PFX structure');
 	}
 }
@@ -455,6 +470,7 @@ function extractContentInfoData(contentInfoDer: Uint8Array): Uint8Array {
 async function extractSafeContents(
 	contentInfoDer: Uint8Array,
 	options: ParsePfxOptions | undefined,
+	budget: KdfBudget,
 ): Promise<
 	| {
 			readonly data: Uint8Array;
@@ -496,12 +512,17 @@ async function extractSafeContents(
 		decrypted = await decryptEncryptedData(
 			contentInfoDer.slice(encryptedData.start - encryptedData.headerLength, encryptedData.end),
 			options.password,
+			budget,
 		);
 	} catch (error) {
+		rethrowIfInvariant(error);
 		if (isWrongPasswordError(error)) {
 			return {
 				error: pfxFailure('invalid_password', 'Invalid PFX password or encrypted content'),
 			};
+		}
+		if (isKdfIterationLimitError(error)) {
+			return { error: pfxFailure('kdf_iterations_exceeded', error.message) };
 		}
 		return {
 			error: pfxFailure('malformed', 'Malformed PFX encrypted content'),
@@ -722,8 +743,46 @@ function normalizeCertificate(source: PfxCertificateSource): Uint8Array {
 	return new Uint8Array(source.der);
 }
 
+/** Parses the MacData block and verifies it against the AuthenticatedSafe when a password is given. */
+async function verifyPfxMacData(
+	macDataDer: Uint8Array,
+	authenticatedSafe: Uint8Array,
+	options: ParsePfxOptions | undefined,
+): Promise<
+	| { readonly macData: ParsedPkcs12MacData; readonly error?: undefined }
+	| {
+			readonly macData?: undefined;
+			readonly error: ErrorResult<ParsePfxErrorCode, Record<never, never>, ParsePfxFailure>;
+	  }
+> {
+	const macResult = await parsePkcs12MacData(
+		macDataDer,
+		authenticatedSafe,
+		options?.macPassword ?? options?.password,
+		options,
+	);
+	if (!macResult.ok) {
+		return {
+			error:
+				macResult.code === 'kdf_iterations_exceeded'
+					? pfxFailure('kdf_iterations_exceeded', macResult.message)
+					: pfxFailure('malformed', 'Malformed PFX MacData'),
+		};
+	}
+	if (macResult.value.verification === 'invalid') {
+		return {
+			error: pfxFailure('invalid_password', 'Invalid PFX MAC password or corrupted content'),
+		};
+	}
+	return { macData: macResult.value };
+}
+
 /** Decrypts a PKCS#7 EncryptedData structure using PBES2 with the given password. */
-function decryptEncryptedData(encryptedDataDer: Uint8Array, password: string): Promise<Uint8Array> {
+function decryptEncryptedData(
+	encryptedDataDer: Uint8Array,
+	password: string,
+	budget: KdfBudget,
+): Promise<Uint8Array> {
 	const topLevel = readSequenceChildren(encryptedDataDer);
 	const encryptedContentInfo = topLevel[1];
 	if (topLevel.length !== 2 || encryptedContentInfo === undefined) {
@@ -755,6 +814,7 @@ function decryptEncryptedData(encryptedDataDer: Uint8Array, password: string): P
 		contentInfoDer.slice(algorithm.start - algorithm.headerLength, algorithm.end),
 		encryptedContent.value,
 		password,
+		budget,
 	);
 }
 

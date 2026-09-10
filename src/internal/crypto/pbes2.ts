@@ -43,6 +43,72 @@ export function isWrongPasswordError(value: unknown): value is Error {
 	return value instanceof Error && wrongPasswordBrand in value;
 }
 
+/** Upper bound on PBKDF2 iteration counts accepted from untrusted input. */
+export const DEFAULT_MAX_KDF_ITERATIONS = 2_000_000;
+
+/**
+ * Upper bound on PKCS#12 KDF iteration counts accepted from untrusted input.
+ * RFC 7292 Appendix B defines the KDF as a chain of single-block digests, so a
+ * round costs a separate WebCrypto call and runs orders of magnitude slower
+ * than a PBKDF2 round.
+ */
+export const DEFAULT_MAX_PKCS12_MAC_ITERATIONS = 100_000;
+
+const kdfIterationLimitBrand = Symbol('micro509.KdfIterationLimitError');
+
+/** Thrown before key derivation when an encoded iteration count exceeds the caller's limit. */
+export function kdfIterationLimitError(iterations: number, remaining: number): Error {
+	return Object.assign(
+		new Error(`KDF iteration count ${iterations} exceeds the remaining budget of ${remaining}`),
+		{ name: 'KdfIterationLimitError', [kdfIterationLimitBrand]: true },
+	);
+}
+
+/** Type guard: was derivation refused because the iteration count exceeds the limit? */
+export function isKdfIterationLimitError(value: unknown): value is Error {
+	return value instanceof Error && kdfIterationLimitBrand in value;
+}
+
+/** Caller-supplied bound on password-based KDF work. */
+export interface KdfLimitOptions {
+	/**
+	 * Maximum KDF iteration count accepted from the input. Higher counts fail
+	 * before any derivation runs. Defaults to `2_000_000` for PBKDF2 and
+	 * `100_000` for the PKCS#12 KDF, which costs far more per round.
+	 */
+	readonly maxKdfIterations?: number;
+}
+
+/**
+ * KDF iterations one operation may still spend. A container decrypting many
+ * entries shares a single budget, so entries that each sit under the ceiling
+ * cannot sum past it.
+ */
+export interface KdfBudget {
+	/** Iterations still available. */
+	remaining: number;
+}
+
+/** Opens a budget from the caller's limit. Throws when that limit is not a positive integer. */
+export function createKdfBudget(
+	options: KdfLimitOptions | undefined,
+	defaultLimit: number = DEFAULT_MAX_KDF_ITERATIONS,
+): KdfBudget {
+	const limit = options?.maxKdfIterations ?? defaultLimit;
+	if (!Number.isSafeInteger(limit) || limit < 1) {
+		throw new RangeError(`Invalid maxKdfIterations: must be an integer >= 1, got ${limit}`);
+	}
+	return { remaining: limit };
+}
+
+/** Charges iterations against the budget, throwing before any derivation runs. */
+export function chargeKdfBudget(budget: KdfBudget, iterations: number): void {
+	if (iterations > budget.remaining) {
+		throw kdfIterationLimitError(iterations, budget.remaining);
+	}
+	budget.remaining -= iterations;
+}
+
 /** AES-CBC key sizes supported by this PBES2 implementation. */
 export type Pbes2EncryptionScheme = 'AES-128-CBC' | 'AES-192-CBC' | 'AES-256-CBC';
 
@@ -136,13 +202,19 @@ export async function encryptPbes2(
 	};
 }
 
-/** Decrypts PBES2 ciphertext given the DER AlgorithmIdentifier and password. Throws on wrong password. */
+/**
+ * Decrypts PBES2 ciphertext given the DER AlgorithmIdentifier and password.
+ * Throws on wrong password, and before derivation when the encoded iteration
+ * count exceeds what `budget` still allows.
+ */
 export async function decryptPbes2(
 	algorithmIdentifierDer: Uint8Array,
 	encryptedData: Uint8Array,
 	password: string,
+	budget: KdfBudget = createKdfBudget(undefined),
 ): Promise<Uint8Array> {
 	const parameters = parsePbes2AlgorithmIdentifier(algorithmIdentifierDer);
+	chargeKdfBudget(budget, parameters.iterations);
 	const key = await deriveAesKey(
 		password,
 		parameters.salt,

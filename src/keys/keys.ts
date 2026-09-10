@@ -42,9 +42,12 @@ import {
 import { OIDS } from '#micro509/internal/asn1/oids';
 import { md5 } from '#micro509/internal/crypto/hash';
 import {
+	createKdfBudget,
 	decryptPbes2,
 	encryptPbes2,
+	isKdfIterationLimitError,
 	isWrongPasswordError,
+	type KdfLimitOptions,
 	type Pbes2Parameters,
 	parsePbes2AlgorithmIdentifier,
 	wrongPasswordError,
@@ -66,6 +69,7 @@ import {
 } from '#micro509/result/result';
 
 export type {
+	KdfLimitOptions,
 	Pbes2EncryptionOptions,
 	Pbes2EncryptionScheme,
 	Pbes2Parameters,
@@ -226,9 +230,17 @@ export type ImportKeyResult<T> =
  * Machine-readable failure reason for the `importEncrypted*` key functions.
  *
  * Distinguishes a wrong decryption password (`'invalid_password'`) from
- * structurally invalid input or algorithm mismatches (`'malformed'`).
+ * structurally invalid input or algorithm mismatches (`'malformed'`), and
+ * from an encoded KDF iteration count above the caller's limit
+ * (`'kdf_iterations_exceeded'`).
  */
-export type ImportEncryptedKeyErrorCode = 'malformed' | 'invalid_password';
+export type ImportEncryptedKeyErrorCode =
+	| 'malformed'
+	| 'invalid_password'
+	| 'kdf_iterations_exceeded';
+
+/** Options for the encrypted PKCS#8 import functions. */
+export type ImportEncryptedKeyOptions = KdfLimitOptions;
 
 /** Structured failure payload for encrypted key import. */
 export interface ImportEncryptedKeyFailure extends Micro509Error<ImportEncryptedKeyErrorCode> {
@@ -701,6 +713,9 @@ async function encryptedImportResult(
 		if (isWrongPasswordError(error)) {
 			return failureResult('invalid_password', error.message);
 		}
+		if (isKdfIterationLimitError(error)) {
+			return failureResult('kdf_iterations_exceeded', error.message);
+		}
 		return failureResult(
 			'malformed',
 			error instanceof Error ? error.message : 'Malformed encrypted key',
@@ -923,8 +938,10 @@ export function importPkcs8Pem(
  * @param der - DER-encoded EncryptedPrivateKeyInfo bytes
  * @param password - Decryption password
  * @param algorithm - Optional expected algorithm; must match decrypted key when given
+ * @param options - KDF work-factor limit
  *
- * @throws {Error} If DER is malformed, password is wrong, or algorithm doesn't match
+ * @throws {Error} If DER is malformed, password is wrong, the PBKDF2 iteration
+ * count exceeds `options.maxKdfIterations`, or algorithm doesn't match
  *
  * @see {@linkcode exportEncryptedPkcs8Der} for the inverse operation
  */
@@ -932,12 +949,14 @@ export async function importEncryptedPkcs8DerOrThrow(
 	der: Uint8Array,
 	password: string,
 	algorithm?: PrivateKeyImportInput,
+	options?: ImportEncryptedKeyOptions,
 ): Promise<CryptoKey> {
 	const envelope = readEncryptedPkcs8Envelope(der);
 	const decrypted = await decryptPbes2(
 		envelope.algorithmIdentifierDer,
 		envelope.encryptedData,
 		password,
+		createKdfBudget(options),
 	);
 	assertDecryptedPrivateKey(
 		() => parsePkcs8PrivateKey(decrypted),
@@ -995,8 +1014,11 @@ export function importEncryptedPkcs8Der(
 	der: Uint8Array,
 	password: string,
 	algorithm?: PrivateKeyImportInput,
+	options?: ImportEncryptedKeyOptions,
 ): Promise<ImportEncryptedKeyResult<CryptoKey>> {
-	return encryptedImportResult(() => importEncryptedPkcs8DerOrThrow(der, password, algorithm));
+	return encryptedImportResult(() =>
+		importEncryptedPkcs8DerOrThrow(der, password, algorithm, options),
+	);
 }
 
 /**
@@ -1015,11 +1037,13 @@ export function importEncryptedPkcs8PemOrThrow(
 	pem: string,
 	password: string,
 	algorithm?: PrivateKeyImportInput,
+	options?: ImportEncryptedKeyOptions,
 ): Promise<CryptoKey> {
 	return importEncryptedPkcs8DerOrThrow(
 		pemDecodeOrThrow('ENCRYPTED PRIVATE KEY', pem),
 		password,
 		algorithm,
+		options,
 	);
 }
 
@@ -1032,8 +1056,11 @@ export function importEncryptedPkcs8Pem(
 	pem: string,
 	password: string,
 	algorithm?: PrivateKeyImportInput,
+	options?: ImportEncryptedKeyOptions,
 ): Promise<ImportEncryptedKeyResult<CryptoKey>> {
-	return encryptedImportResult(() => importEncryptedPkcs8PemOrThrow(pem, password, algorithm));
+	return encryptedImportResult(() =>
+		importEncryptedPkcs8PemOrThrow(pem, password, algorithm, options),
+	);
 }
 
 /**

@@ -22,7 +22,7 @@ jobs:
     env: { RERUNS: "${{ inputs.reruns || '100' }}" }
     steps:
       - { uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: { persist-credentials: false } } # v7
-      - { uses: ./.github/actions/setup-ts, with: { install-bun: "true" } }
+      - { uses: $/.github/actions/setup-ts, with: { install-bun: "true" } }
       - name: Install and build dist (root-barrel test imports the `micro509` package name)
         run: runner install -f build
       - name: Run suite with randomized order (failure output includes --seed for repro)

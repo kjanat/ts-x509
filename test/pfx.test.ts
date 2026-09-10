@@ -13,13 +13,17 @@ import {
 import {
 	explicitContext,
 	integerFromNumber,
+	nullValue,
 	objectIdentifier,
 	octetString,
+	readSequenceChildren,
 	sequence,
 	setOf,
 	tlv,
 } from '#micro509/internal/asn1/der';
 import { OIDS } from '#micro509/internal/asn1/oids';
+import { parsePkcs12MacData } from '#micro509/pkcs';
+import { childrenOf } from '#test/helpers';
 
 /** Success-path helper: builds a PFX and unwraps the typed result. */
 async function buildPfx(input: CreatePfxInput) {
@@ -971,3 +975,108 @@ function bmpString(value: string): Uint8Array {
 	}
 	return new Uint8Array([0x1e, bytes.length, ...bytes]);
 }
+
+describe('PFX KDF work-factor limit', () => {
+	async function issuePfx(iterations: { readonly encryption: number; readonly mac: number }) {
+		const keys = await generateKeyPair({ kind: 'ecdsa', curve: 'P-256' });
+		return buildPfx({
+			privateKeys: [{ privateKey: keys.privateKey }],
+			encryption: { password: 'pw', iterations: iterations.encryption },
+			mac: { password: 'pw', iterations: iterations.mac },
+		});
+	}
+
+	it('rejects MacData iteration counts above maxKdfIterations', async () => {
+		const pfx = await issuePfx({ encryption: 1024, mac: 4096 });
+		const result = await parsePfxDer(pfx.der, { password: 'pw', maxKdfIterations: 2048 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe('kdf_iterations_exceeded');
+		}
+	});
+
+	it('rejects PBES2 iteration counts above maxKdfIterations', async () => {
+		const pfx = await issuePfx({ encryption: 4096, mac: 1024 });
+		const result = await parsePfxDer(pfx.der, { password: 'pw', maxKdfIterations: 2048 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe('kdf_iterations_exceeded');
+		}
+		const accepted = await parsePfxDer(pfx.der, { password: 'pw', maxKdfIterations: 4096 });
+		expect(accepted.ok).toBe(true);
+	});
+
+	it('caps PKCS#12 MAC iterations at 100,000 by default', async () => {
+		// The PKCS#12 KDF runs one awaited digest per round from JS, so it costs
+		// far more per iteration than native PBKDF2 and needs a lower ceiling.
+		const macData = (iterations: number) =>
+			sequence([
+				sequence([
+					sequence([objectIdentifier(OIDS.sha256), nullValue()]),
+					octetString(new Uint8Array(32)),
+				]),
+				octetString(new Uint8Array(8)),
+				integerFromNumber(iterations),
+			]);
+
+		const rejected = await parsePkcs12MacData(macData(100_001), new Uint8Array(4), 'pw');
+		expect(rejected.ok).toBe(false);
+		if (!rejected.ok) {
+			expect(rejected.code).toBe('kdf_iterations_exceeded');
+		}
+
+		const accepted = await parsePkcs12MacData(macData(2_048), new Uint8Array(4), 'pw');
+		expect(accepted.ok).toBe(true);
+	});
+
+	it('bounds KDF work across every encrypted entry, not per entry', async () => {
+		const keys = await generateKeyPair({ kind: 'ecdsa', curve: 'P-256' });
+		const base = await buildPfx({
+			privateKeys: [{ privateKey: keys.privateKey }],
+			encryption: { password: 'pw', iterations: 1_000 },
+		});
+
+		// createPfx emits one encrypted ContentInfo; repeat it so the file asks
+		// for the same work many times over without any single count standing out.
+		const top = readSequenceChildren(base.der);
+		const authSafe = top[1];
+		if (authSafe === undefined) throw new Error('missing AuthenticatedSafe');
+		const authSafeDer = base.der.slice(authSafe.start - authSafe.headerLength, authSafe.end);
+		const wrapper = readSequenceChildren(authSafeDer)[1];
+		if (wrapper === undefined) throw new Error('missing content wrapper');
+		const octets = childrenOf(authSafeDer, wrapper)[0];
+		if (octets === undefined) throw new Error('missing content octets');
+		const entries = readSequenceChildren(octets.value);
+		const entry = entries[0];
+		if (entry === undefined) throw new Error('missing encrypted entry');
+		const entryDer = octets.value.slice(entry.start - entry.headerLength, entry.end);
+
+		const repeats = 50;
+		const inflated = sequence([
+			integerFromNumber(3),
+			sequence([
+				objectIdentifier(OIDS.pkcs7Data),
+				explicitContext(0, octetString(sequence(Array.from({ length: repeats }, () => entryDer)))),
+			]),
+		]);
+
+		// Each entry asks for 1,000 rounds, well under the ceiling; together they
+		// ask for 50,000.
+		const result = await parsePfxDer(inflated, { password: 'pw', maxKdfIterations: 10_000 });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.code).toBe('kdf_iterations_exceeded');
+		}
+
+		const withinBudget = await parsePfxDer(inflated, { password: 'pw', maxKdfIterations: 60_000 });
+		expect(withinBudget.ok).toBe(true);
+	});
+
+	it('reports an invalid maxKdfIterations as an invariant, not malformed input', async () => {
+		const pfx = await issuePfx({ encryption: 1024, mac: 1024 });
+
+		expect(parsePfxDer(pfx.der, { password: 'pw', maxKdfIterations: 0 })).rejects.toThrow(
+			RangeError,
+		);
+	});
+});

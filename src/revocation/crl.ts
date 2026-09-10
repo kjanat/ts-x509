@@ -277,6 +277,12 @@ export interface ValidateCertificateRevocationListInput {
 	readonly at?: Date;
 	/** Tolerance in milliseconds for clock skew when checking `thisUpdate`/`nextUpdate`. */
 	readonly clockSkewMs?: number;
+	/**
+	 * Maximum age of `thisUpdate` at `at`, in milliseconds. A CRL older than
+	 * this fails with `stale_crl` even when `nextUpdate` is absent or later.
+	 * Unbounded by default.
+	 */
+	readonly maxAgeMs?: number;
 }
 
 /**
@@ -325,6 +331,8 @@ export interface CheckCertificateRevocationAgainstCrlInput {
 	readonly at?: Date;
 	/** Clock-skew tolerance in milliseconds for freshness checks. */
 	readonly clockSkewMs?: number;
+	/** Maximum age of each CRL's `thisUpdate` in milliseconds. See {@linkcode ValidateCertificateRevocationListInput.maxAgeMs}. */
+	readonly maxAgeMs?: number;
 }
 
 /** Error codes that {@linkcode checkCertificateRevocationAgainstCrl} may return. */
@@ -869,7 +877,28 @@ export async function validateCertificateRevocationList(
 			'CRL is not valid at requested time',
 		);
 	}
+	if (exceedsCrlMaxAge(parsedCrl, at, skew, input.maxAgeMs)) {
+		return validateCertificateRevocationListFailureResult(
+			'stale_crl',
+			'CRL thisUpdate is older than the maximum age',
+		);
+	}
 	return { ok: true, value: parsedCrl };
+}
+
+function exceedsCrlMaxAge(
+	crl: ParsedCertificateRevocationList,
+	at: Date,
+	skew: number,
+	maxAgeMs: number | undefined,
+): boolean {
+	if (maxAgeMs === undefined) {
+		return false;
+	}
+	if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+		throw new RangeError(`Invalid maxAgeMs: must be a non-negative number, got ${maxAgeMs}`);
+	}
+	return at.getTime() - crl.thisUpdate.getTime() > maxAgeMs + skew;
 }
 
 /**
@@ -911,6 +940,7 @@ export async function checkCertificateRevocationAgainstCrl(
 		issuerCertificate: input.issuerCertificate,
 		...(input.at === undefined ? {} : { at: input.at }),
 		...(input.clockSkewMs === undefined ? {} : { clockSkewMs: input.clockSkewMs }),
+		...(input.maxAgeMs === undefined ? {} : { maxAgeMs: input.maxAgeMs }),
 	});
 	if (!validated.ok) {
 		return checkCertificateRevocationAgainstCrlFailureResult(validated.code, validated.message);
@@ -978,6 +1008,7 @@ async function validateOptionalDeltaCrl(
 		issuerCertificate: input.issuerCertificate,
 		...(input.at === undefined ? {} : { at: input.at }),
 		...(input.clockSkewMs === undefined ? {} : { clockSkewMs: input.clockSkewMs }),
+		...(input.maxAgeMs === undefined ? {} : { maxAgeMs: input.maxAgeMs }),
 	});
 	if (!deltaValidation.ok) {
 		return checkCertificateRevocationAgainstCrlFailureResult(

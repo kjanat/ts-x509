@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 5
     steps: [
       { uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: { persist-credentials: false } }, # v7
-      { uses: ./.github/actions/setup-ts, with: { install-bun: true, install-deno: true } },
+      { uses: $/.github/actions/setup-ts, with: { install-bun: true, install-deno: true } },
       { run: runner install -f site:build, env: { GITHUB_TOKEN: "${{ github.token }}" } },
       { name: Verify import maps, run: run site:import-maps },
       { uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9, with: { path: site/.vitepress/dist } }, # v5

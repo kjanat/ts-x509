@@ -122,6 +122,11 @@ revoked 02: ${isCertificateRevoked('02', parsed)}`);
 
 </LiveCode>
 
+`nextUpdate` is optional in RFC 5280, and a CRL without one never goes stale
+on its own, so a replayed pre-revocation CRL would validate forever. Set
+`maxAgeMs` to bound how old `thisUpdate` may be; the same knob is
+`crlMaxAgeMs` on the chain-level revocation policy.
+
 ## OCSP
 
 ### Build a request

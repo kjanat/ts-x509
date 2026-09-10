@@ -8,7 +8,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - { uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: { persist-credentials: false } } # v7
-      - { uses: ./.github/actions/setup-ts, with: { install-bun: "true" } }
+      - { uses: $/.github/actions/setup-ts, with: { install-bun: "true" } }
       - uses: kjanat/install-dprint@43ace6752278feeb7c40262e29286b6342e33865 # v2
       - run: dprint config update -yr
         if: github.ref == 'refs/heads/master' && github.event_name == 'push'

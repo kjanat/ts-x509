@@ -19,17 +19,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `maxKdfIterations` on the encrypted PKCS#8 imports (`ImportEncryptedKeyOptions`,
+  fourth argument), `parsePfxDer` / `parsePfxPem` options, and
+  `parsePkcs12MacData` bounds the PBKDF2 and PKCS#12 KDF iteration counts a
+  file may demand. Above the bound the import fails with
+  `kdf_iterations_exceeded` before any derivation runs. The default is
+  2,000,000 for PBKDF2 and 100,000 for the PKCS#12 KDF, which RFC 7292
+  Appendix B derives one digest at a time. See Security.
+- `maxAgeMs` on `validateCertificateRevocationList` and
+  `checkCertificateRevocationAgainstCrl`, `crlMaxAgeMs` on
+  `checkCertificateRevocation` and the chain-level `RevocationPolicy`, bound
+  how old a CRL's `thisUpdate` may be. See Security.
+
 ### Changed
 
 - npm and JSR packages include `CHANGELOG.md` in the published tarball
   (`package.json` `files`, `jsr.json` `publish.include`).
+- `trustedOcspResponders` on `checkChainRevocation()` and
+  `verifyCertificateChain({ revocation })` takes `TrustedOcspResponder`
+  entries (`{ issuerCertificate, responderCertificate }`) instead of bare
+  certificates. See Security.
 
 ### Fixed
 
+- A CRL rejected by `crlMaxAgeMs` reported `no_applicable_crl` on the chain
+  result, hiding the configured freshness policy's actual outcome. It now
+  reports `crl_expired`.
 - Two `site/guide/keys.md` LiveCode examples used TypeScript parameter types
   (`key: CryptoKey`, `bytes: Uint8Array`). LiveCode injects examples as browser
   JS modules, so Run failed with `missing ) after argument list` and
   `Unexpected token ':'`. The annotations are removed.
+
+### Security
+
+- Chain-level OCSP evaluation returned on the first validated `good` response,
+  so a `revoked` response later in `ocspResponses` was never read and a
+  revoked certificate passed with `decision: 'allow'`. Every applicable
+  response is now validated; any validated `revoked` verdict wins regardless
+  of position, and otherwise the freshest validated `good` response by
+  `thisUpdate` is reported. A `certificateHold` (RFC 5280 §5.3.1 reason 6)
+  still denies unless a validated `good` response carries a later
+  `thisUpdate`, which clears the hold.
+  (https://github.com/kjanat/micro509/pull/108,
+  https://github.com/kjanat/micro509/pull/110)
+- `trustedOcspResponders` on chain-level revocation was a flat list applied to
+  every issuer in the chain, so a responder trusted for one CA could assert
+  status for certificates issued by any other CA in the same path (RFC 6960
+  §4.2.2.2 criterion 1 binds local trust to the issuing CA). Each entry now
+  names the issuer it is trusted for, and only responders bound to the issuer
+  under evaluation reach `validateOcspResponse`.
+  (https://github.com/kjanat/micro509/pull/111)
+- URI-ID matching accepted a scheme-specific path as an authority, so a
+  hostless SAN such as `https:verify.example` matched the reference identifier
+  `https://verify.example` in `verifyCertificateChain` and
+  `validateForTlsServer`. A URI now needs a syntactically valid scheme and an
+  explicit `//` authority (RFC 3986 §3.2), and its reg-name must normalize as a
+  DNS name; `sip:` and `sips:` keep their authority-less form (RFC 3261 §19.1).
+  (https://github.com/kjanat/micro509/pull/109)
+- `ecdsaSignatureDerToRaw` and the ECDSA verify path trimmed leading zero
+  bytes from each `ECDSA-Sig-Value` INTEGER without checking the encoding, so
+  an empty, negative, or non-minimally encoded `r` or `s` (X.690 §8.3)
+  normalized into a raw signature WebCrypto could verify, giving a second
+  accepted encoding of one signature. Such INTEGERs are now rejected.
+  (https://github.com/kjanat/micro509/pull/100)
+- `verifyPkcs7SignedData` reported `ok: true` for a detached `SignedData`
+  whose `signerInfos` set was empty when the caller supplied `content`,
+  verifying nothing. A `SignedData` with no signer now fails with `malformed`.
+  (https://github.com/kjanat/micro509/pull/106)
+- Distinguished-name comparison classified combining marks with the runtime's
+  `\p{M}`, which tracks the host Unicode version. RFC 4518 §2.6.1 keys
+  insignificant-space handling on combining marks, and Appendix A lists them
+  definitively against the Unicode 3.2 repertoire §2.1 fixes. A code point
+  reclassified since 3.2 (U+1885, U+06DE) changed which spaces survived, so a
+  directoryName excluded subtree could fail to match. The Appendix A set is
+  now generated from the vendored RFC text and guarded by a test that
+  re-derives it. (https://github.com/kjanat/micro509/pull/102)
+- A caller-supplied extension decoder that threw a native error (for example
+  `TextDecoder` with `fatal: true` on invalid UTF-8) escaped the
+  Result-returning certificate and CSR parse functions as an exception. The
+  decoder boundary now maps such errors to `code: 'malformed'`, so attacker
+  bytes in an extension cannot crash a parser call.
+  (https://github.com/kjanat/micro509/pull/107)
+- The `site/guide/revocation.md` CRL example looked up revoked entries after a
+  failed signature check. It now calls `validateCertificateRevocationList` and
+  reads entries only from the validated value.
+  (https://github.com/kjanat/micro509/pull/104)
+- Third-party GitHub Actions in the release, test, and site workflows are
+  pinned to commit SHAs again; mutable tags had let upstream ref movement run
+  unreviewed code with `id-token: write` and `contents: write`.
+  (https://github.com/kjanat/micro509/pull/103)
+- Encrypted PKCS#8 import and PFX parsing ran PBKDF2, and PFX MAC
+  verification ran the PKCS#12 KDF, for whatever iteration count the file
+  encoded before the password or ciphertext could be rejected. A 122-byte
+  EncryptedPrivateKeyInfo or a 177-byte PFX carrying `0x7fffffff` iterations
+  held the CPU for minutes. Counts above the ceiling are now refused before
+  derivation; `maxKdfIterations` adjusts it.
+- A PFX gave every encrypted entry the full `maxKdfIterations` allowance, so a
+  file with many small entries could demand unbounded work without any encoded
+  count standing out: 100 entries at the default ceiling ask for 200 million
+  PBKDF2 rounds. One budget now covers the whole file.
+- Bare trust anchors were re-verified on every visit to a certificate, because
+  the anchor match ran before the dead-end lookup. A bundle of same-subject CAs
+  plus a few subject-matching anchors made anchor signature checks grow with
+  the search graph rather than the input: 40 candidates and 20 anchors cost
+  3.7s. Each certificate-and-anchor pair is now checked once per search.
+- Path building memoized dead ends per visited set, so a bundle of `n`
+  same-subject CA certificates sharing one key cost on the order of `n³`
+  signature verifications before `no_trusted_root` (30 candidates: 9,426 key
+  imports and 18,852 verify calls). Dead ends are now memoized per certificate
+  and CA count, and each certificate-to-key signature check runs once per
+  search.
+- A CRL without `nextUpdate` validated at any later time, so a replayed CRL
+  from before a revocation stayed usable indefinitely. RFC 5280 §5.1.2.5 makes
+  `nextUpdate` optional, so the check remains opt-in: `maxAgeMs` /
+  `crlMaxAgeMs` reject a CRL whose `thisUpdate` is older than the bound with
+  `stale_crl`.
+- The dprint TOML formatter installed `tombi` unversioned and globally from
+  npm on every fresh setup, so the registry chose the code that ran. `tombi`
+  is now a catalog-pinned devDependency; the exec plugin runs
+  `node_modules/.bin/tombi` and its setup command is `bun install`.
+- The OpenSSL differential job ran against whatever OpenSSL the runner image
+  shipped. It now pins `ubuntu-26.04` and fails unless `openssl version`
+  reports 3.5.5, so an oracle change surfaces as a version assertion instead
+  of as verdict or formatting drift.
 
 ## [0.14.0] - 2026-07-29
 
